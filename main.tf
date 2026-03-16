@@ -2,6 +2,41 @@ provider "aws" {
   region = "us-east-1"
 }
 
+# You already have Kubernetes provider configured with EKS outputs
+# provider "kubernetes" {
+#   alias                  = "eks"
+#   host                   = data.aws_eks_cluster.eks.endpoint
+#   cluster_ca_certificate = base64decode(data.aws_eks_cluster.eks.certificate_authority[0].data)
+#   token                  = data.aws_eks_cluster_auth.eks.token
+# }
+
+provider "kubernetes" {
+  alias                  = "eks"
+  host                   = data.aws_eks_cluster.eks.endpoint
+  cluster_ca_certificate = base64decode(data.aws_eks_cluster.eks.certificate_authority[0].data)
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", aws_eks_cluster.eks.name]
+  }
+}
+
+# Add Helm provider (uses same cluster connection as kubernetes provider)
+provider "helm" {
+  kubernetes = {
+    host                   = data.aws_eks_cluster.eks.endpoint
+    cluster_ca_certificate = base64decode(data.aws_eks_cluster.eks.certificate_authority[0].data)
+
+    exec = {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args        = ["eks", "get-token", "--cluster-name", aws_eks_cluster.eks.name]
+    }
+  }
+}
+
+
 data "aws_availability_zones" "available" {}
 
 # VPC
@@ -235,19 +270,11 @@ resource "aws_iam_user_policy_attachment" "devops_policy_attach" {
 
 variable "aws_account_id" {
   type = string
-  default = "211125319040"
+  default = "923884399574"
 }
 
 data "aws_eks_cluster_auth" "eks" {
   name = data.aws_eks_cluster.eks.name
-}
-
-
-provider "kubernetes" {
-  alias                  = "eks"
-  host                   = data.aws_eks_cluster.eks.endpoint
-  cluster_ca_certificate = base64decode(data.aws_eks_cluster.eks.certificate_authority[0].data)
-  token                  = data.aws_eks_cluster_auth.eks.token
 }
 
 resource "kubernetes_config_map" "aws_auth" {
@@ -285,4 +312,112 @@ output "devops_user_credentials" {
     }
   }
   sensitive = true
+}
+
+resource "aws_iam_role" "alb_controller" {
+  name = "alb-controller-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = aws_iam_openid_connect_provider.eks_oidc.arn
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "${replace(data.aws_eks_cluster.eks.identity[0].oidc[0].issuer, "https://", "")}:sub" = "system:serviceaccount:kube-system:alb-controller"
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "alb_controller_attach" {
+  role       = aws_iam_role.alb_controller.name
+  policy_arn = "arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess"
+}
+
+resource "kubernetes_service_account" "alb_controller" {
+  provider = kubernetes.eks
+  metadata {
+    name      = "alb-controller"
+    namespace = "kube-system"
+    annotations = {
+      "eks.amazonaws.com/role-arn" = aws_iam_role.alb_controller.arn
+    }
+  }
+}
+
+resource "helm_release" "alb_controller" {
+  name       = "aws-load-balancer-controller"
+  repository = "https://aws.github.io/eks-charts"
+  chart      = "aws-load-balancer-controller"
+  namespace  = "kube-system"
+
+  set = [
+    {
+      name  = "clusterName"
+      value = aws_eks_cluster.eks.name
+    },
+    {
+      name  = "serviceAccount.create"
+      value = "false"
+    },
+    {
+      name  = "serviceAccount.name"
+      value = kubernetes_service_account.alb_controller.metadata[0].name
+    }
+  ]
+}
+
+resource "helm_release" "argocd" {
+  depends_on = [aws_eks_cluster.eks]
+  name             = "argocd"
+  repository       = "https://argoproj.github.io/argo-helm"
+  chart            = "argo-cd"
+  namespace        = "argocd"
+  create_namespace = true
+
+  set = [
+    {
+      name  = "server.service.type"
+      value = "ClusterIP"
+    }
+  ]
+}
+
+resource "kubernetes_manifest" "argocd_ingress" {
+  provider = kubernetes.eks
+  depends_on = [helm_release.argocd]
+  manifest = {
+    apiVersion = "networking.k8s.io/v1"
+    kind       = "Ingress"
+    metadata = {
+      name      = "argocd-server-ingress"
+      namespace = "argocd"
+      annotations = {
+        "kubernetes.io/ingress.class"          = "alb"
+        "alb.ingress.kubernetes.io/scheme"     = "internet-facing"
+        "alb.ingress.kubernetes.io/group.name" = "argocd-public"
+      }
+    }
+    spec = {
+      rules = [{
+        host = "argocd.example.com"
+        http = {
+          paths = [{
+            path     = "/"
+            pathType = "Prefix"
+            backend = {
+              service = {
+                name = "argocd-server"
+                port = { number = 80 }
+              }
+            }
+          }]
+        }
+      }]
+    }
+  }
 }
