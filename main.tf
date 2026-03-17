@@ -1,6 +1,20 @@
+terraform {
+  required_providers {
+    kubectl = {
+      source  = "gavinbunney/kubectl"
+      version = ">= 1.14.0"
+    }
+    http = {
+      source  = "hashicorp/http"
+      version = ">= 3.0.0"
+    }
+  }
+}
+
 provider "aws" {
   region = "us-east-1"
 }
+
 
 # You already have Kubernetes provider configured with EKS outputs
 # provider "kubernetes" {
@@ -12,8 +26,8 @@ provider "aws" {
 
 provider "kubernetes" {
   alias                  = "eks"
-  host                   = data.aws_eks_cluster.eks.endpoint
-  cluster_ca_certificate = base64decode(data.aws_eks_cluster.eks.certificate_authority[0].data)
+  host                   = aws_eks_cluster.eks.endpoint
+  cluster_ca_certificate = base64decode(aws_eks_cluster.eks.certificate_authority[0].data)
 
   exec {
     api_version = "client.authentication.k8s.io/v1beta1"
@@ -22,17 +36,28 @@ provider "kubernetes" {
   }
 }
 
-# Add Helm provider (uses same cluster connection as kubernetes provider)
 provider "helm" {
   kubernetes = {
-    host                   = data.aws_eks_cluster.eks.endpoint
-    cluster_ca_certificate = base64decode(data.aws_eks_cluster.eks.certificate_authority[0].data)
+    host                   = aws_eks_cluster.eks.endpoint
+    cluster_ca_certificate = base64decode(aws_eks_cluster.eks.certificate_authority[0].data)
 
     exec = {
       api_version = "client.authentication.k8s.io/v1beta1"
       command     = "aws"
       args        = ["eks", "get-token", "--cluster-name", aws_eks_cluster.eks.name]
     }
+  }
+}
+
+provider "kubectl" {
+  host                   = aws_eks_cluster.eks.endpoint
+  cluster_ca_certificate = base64decode(aws_eks_cluster.eks.certificate_authority[0].data)
+  load_config_file       = false
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", aws_eks_cluster.eks.name]
   }
 }
 
@@ -54,14 +79,17 @@ resource "aws_subnet" "public" {
   cidr_block              = cidrsubnet(aws_vpc.main.cidr_block, 8, count.index)
   availability_zone       = data.aws_availability_zones.available.names[count.index]
   map_public_ip_on_launch = true
-  tags = { Name = "public-subnet-${count.index}" }
+  tags = {
+    Name                     = "public-subnet-${count.index}"
+    "kubernetes.io/role/elb" = "1"
+  }
 }
 
 resource "aws_subnet" "private" {
   count             = 2
   vpc_id            = aws_vpc.main.id
   cidr_block        = cidrsubnet(aws_vpc.main.cidr_block, 8, count.index + 2)
-  availability_zone = data.aws_availability_zones.available.names[count.index + 2]
+  availability_zone = data.aws_availability_zones.available.names[count.index]
   tags = {
     Name = "private-subnet-${count.index}"
     "kubernetes.io/role/internal-elb" = "1"
@@ -219,7 +247,7 @@ resource "aws_eks_node_group" "eks_nodes" {
   subnet_ids      = aws_subnet.private[*].id
 
   scaling_config {
-    desired_size = 2
+    desired_size = 3
     max_size     = 3
     min_size     = 1
   }
@@ -270,7 +298,7 @@ resource "aws_iam_user_policy_attachment" "devops_policy_attach" {
 
 variable "aws_account_id" {
   type = string
-  default = "923884399574"
+  default = "608283508317"
 }
 
 data "aws_eks_cluster_auth" "eks" {
@@ -333,9 +361,18 @@ resource "aws_iam_role" "alb_controller" {
   })
 }
 
+data "http" "alb_controller_policy" {
+  url = "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json"
+}
+
+resource "aws_iam_policy" "alb_controller" {
+  name   = "AWSLoadBalancerControllerIAMPolicy"
+  policy = data.http.alb_controller_policy.response_body
+}
+
 resource "aws_iam_role_policy_attachment" "alb_controller_attach" {
   role       = aws_iam_role.alb_controller.name
-  policy_arn = "arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess"
+  policy_arn = aws_iam_policy.alb_controller.arn
 }
 
 resource "kubernetes_service_account" "alb_controller" {
@@ -350,10 +387,14 @@ resource "kubernetes_service_account" "alb_controller" {
 }
 
 resource "helm_release" "alb_controller" {
-  name       = "aws-load-balancer-controller"
-  repository = "https://aws.github.io/eks-charts"
-  chart      = "aws-load-balancer-controller"
-  namespace  = "kube-system"
+  depends_on      = [kubernetes_service_account.alb_controller]
+  name            = "aws-load-balancer-controller"
+  repository      = "https://aws.github.io/eks-charts"
+  chart           = "aws-load-balancer-controller"
+  namespace       = "kube-system"
+  wait            = true
+  timeout         = 300
+  cleanup_on_fail = true
 
   set = [
     {
@@ -367,12 +408,20 @@ resource "helm_release" "alb_controller" {
     {
       name  = "serviceAccount.name"
       value = kubernetes_service_account.alb_controller.metadata[0].name
+    },
+    {
+      name  = "vpcId"
+      value = aws_vpc.main.id
+    },
+    {
+      name  = "region"
+      value = "us-east-1"
     }
   ]
 }
 
 resource "helm_release" "argocd" {
-  depends_on = [aws_eks_cluster.eks]
+  depends_on = [helm_release.alb_controller]
   name             = "argocd"
   repository       = "https://argoproj.github.io/argo-helm"
   chart            = "argo-cd"
@@ -383,41 +432,39 @@ resource "helm_release" "argocd" {
     {
       name  = "server.service.type"
       value = "ClusterIP"
+    },
+    {
+      name  = "server.extraArgs"
+      value = "{--insecure}"
     }
   ]
 }
 
-resource "kubernetes_manifest" "argocd_ingress" {
-  provider = kubernetes.eks
+resource "kubectl_manifest" "argocd_ingress" {
   depends_on = [helm_release.argocd]
-  manifest = {
-    apiVersion = "networking.k8s.io/v1"
-    kind       = "Ingress"
-    metadata = {
-      name      = "argocd-server-ingress"
-      namespace = "argocd"
-      annotations = {
-        "kubernetes.io/ingress.class"          = "alb"
-        "alb.ingress.kubernetes.io/scheme"     = "internet-facing"
-        "alb.ingress.kubernetes.io/group.name" = "argocd-public"
-      }
-    }
-    spec = {
-      rules = [{
-        host = "argocd.example.com"
-        http = {
-          paths = [{
-            path     = "/"
-            pathType = "Prefix"
-            backend = {
-              service = {
-                name = "argocd-server"
-                port = { number = 80 }
-              }
-            }
-          }]
-        }
-      }]
-    }
-  }
+  yaml_body  = <<-YAML
+    apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: argocd-server-ingress
+      namespace: argocd
+      annotations:
+        alb.ingress.kubernetes.io/scheme: internet-facing
+        alb.ingress.kubernetes.io/target-type: ip
+        alb.ingress.kubernetes.io/group.name: argocd-public
+        alb.ingress.kubernetes.io/healthcheck-path: /healthz
+        alb.ingress.kubernetes.io/success-codes: "200"
+    spec:
+      ingressClassName: alb
+      rules:
+        - http:
+            paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: argocd-server
+                    port:
+                      number: 80
+  YAML
 }
