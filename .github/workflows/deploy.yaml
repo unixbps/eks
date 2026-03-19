@@ -1,0 +1,139 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'apps/hello-world/**'
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: hello-world
+  EKS_CLUSTER_NAME: eks-cluster
+  ARGOCD_APP_NAME: hello-world
+
+jobs:
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: apps/hello-world
+          file: apps/hello-world/Dockerfile
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=registry,ref=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-to: type=inline
+
+  update-image-tag:
+    name: Update Image Tag in values.yaml
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update image tag in values.yaml
+        run: |
+          sed -i "s/tag: .*/tag: \"${{ needs.build-and-push.outputs.image-tag }}\"/" \
+            apps/hello-world/chart/values.yaml
+
+      - name: Commit and push updated values.yaml
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add apps/hello-world/chart/values.yaml
+          git commit -m "chore: update hello-world image tag to ${{ needs.build-and-push.outputs.image-tag }}"
+          git push
+
+  sync-argocd:
+    name: Sync ArgoCD Application
+    runs-on: ubuntu-latest
+    needs: update-image-tag
+    environment: production
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+      - name: Get ArgoCD admin password
+        id: argocd-password
+        run: |
+          PASSWORD=$(kubectl get secret -n argocd argocd-initial-admin-secret \
+            -o jsonpath="{.data.password}" | base64 -d)
+          echo "password=${PASSWORD}" >> $GITHUB_OUTPUT
+
+      - name: Get ArgoCD server URL
+        id: argocd-url
+        run: |
+          URL=$(kubectl get ingress -n argocd argocd-server-ingress \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "url=${URL}" >> $GITHUB_OUTPUT
+
+      - name: Login to ArgoCD
+        run: |
+          argocd login ${{ steps.argocd-url.outputs.url }} \
+            --username admin \
+            --password ${{ steps.argocd-password.outputs.password }} \
+            --insecure \
+            --grpc-web
+
+      - name: Sync ArgoCD application
+        run: |
+          argocd app sync ${{ env.ARGOCD_APP_NAME }} \
+            --grpc-web \
+            --timeout 300
+
+      - name: Wait for ArgoCD rollout to complete
+        run: |
+          argocd app wait ${{ env.ARGOCD_APP_NAME }} \
+            --health \
+            --timeout 300 \
+            --grpc-web
