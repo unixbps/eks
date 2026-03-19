@@ -99,3 +99,95 @@ resource "kubectl_manifest" "argocd_ingress" {
                       number: 80
   YAML
 }
+
+# -----------------------------
+# Metrics Server Helm Release
+# -----------------------------
+resource "helm_release" "metrics_server" {
+  name       = "metrics-server"
+  namespace  = "kube-system"
+  repository = "https://kubernetes-sigs.github.io/metrics-server/"
+  chart      = "metrics-server"
+  version    = "3.10.0"
+
+  values = [
+    <<EOF
+args:
+  - --kubelet-insecure-tls
+EOF
+  ]
+}
+
+# -----------------------------
+# IAM Role for External Secrets
+# -----------------------------
+resource "aws_iam_role" "external_secrets" {
+  name               = "external-secrets-irsa"
+  assume_role_policy = data.aws_iam_policy_document.external_secrets_assume.json
+}
+
+data "aws_iam_policy_document" "external_secrets_assume" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [module.eks.oidc_provider_arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${module.eks.oidc_provider}:sub"
+      values   = ["system:serviceaccount:external-secrets:external-secrets-sa"]
+    }
+  }
+}
+
+resource "aws_iam_policy" "external_secrets" {
+  name        = "external-secrets-policy"
+  description = "Allow access to AWS Secrets Manager and SSM Parameter Store"
+
+  policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "ssm:GetParameter",
+        "ssm:GetParameters"
+      ],
+      "Effect": "Allow",
+      "Resource": "*"
+    }
+  ]
+}
+EOF
+}
+
+resource "aws_iam_role_policy_attachment" "external_secrets_attach" {
+  role       = aws_iam_role.external_secrets.name
+  policy_arn = aws_iam_policy.external_secrets.arn
+}
+
+# -----------------------------
+# External Secrets Helm Release
+# -----------------------------
+resource "helm_release" "external_secrets" {
+  name             = "external-secrets"
+  namespace        = "external-secrets"
+  repository       = "https://charts.external-secrets.io"
+  chart            = "external-secrets"
+  version          = "0.9.11"
+  create_namespace = true
+
+  values = [
+    <<EOF
+serviceAccount:
+  create: true
+  name: external-secrets-sa
+  annotations:
+    eks.amazonaws.com/role-arn: ${aws_iam_role.external_secrets.arn}
+EOF
+  ]
+}
