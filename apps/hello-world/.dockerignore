@@ -1,0 +1,6 @@
+node_modules
+.github
+chart
+*.md
+.git
+.gitignore
