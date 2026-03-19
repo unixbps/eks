@@ -76,26 +76,6 @@ variable "devops_user_names" {
   ]
 }
 
-resource "kubernetes_config_map" "aws_auth" {
-  metadata {
-    name      = "aws-auth"
-    namespace = "kube-system"
-  }
-
-  data = {
-    mapUsers = yamlencode([
-      for user in var.devops_user_names : {
-        userarn  = "arn:aws:iam::${var.aws_account_id}:user/${user}"
-        username = user
-        groups   = ["system:masters"]
-      }
-    ])
-  }
-
-  lifecycle {
-    ignore_changes = [data]
-  }
-}
 
 # ALB Controller IAM
 resource "aws_iam_role" "alb_controller" {
