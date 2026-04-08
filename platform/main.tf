@@ -32,6 +32,13 @@ locals {
   cluster_ca       = data.terraform_remote_state.infra.outputs.cluster_ca_certificate
 }
 
+data "terraform_remote_state" "addons" {
+  backend = "local"
+  config = {
+    path = "../addons/terraform.tfstate"
+  }
+}
+
 provider "helm" {
   kubernetes = {
     host                   = local.cluster_endpoint
@@ -58,6 +65,18 @@ provider "kubectl" {
 }
 
 # ArgoCD
+
+# Annotate argocd-repo-server ServiceAccount for IRSA (ECR access)
+resource "kubernetes_service_account" "argocd_repo_server" {
+  metadata {
+    name      = "argocd-repo-server"
+    namespace = "argocd"
+    annotations = {
+      "eks.amazonaws.com/role-arn" = data.terraform_remote_state.addons.outputs.argocd_repo_server_role_arn != null ? data.terraform_remote_state.addons.outputs.argocd_repo_server_role_arn : "<FILL-IN-ROLE-ARN>"
+    }
+  }
+  depends_on = [helm_release.argocd]
+}
 resource "helm_release" "argocd" {
   name             = "argocd"
   repository       = "https://argoproj.github.io/argo-helm"
